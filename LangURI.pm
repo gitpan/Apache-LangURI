@@ -17,7 +17,7 @@ BEGIN {
 
   require mod_perl;
 
-  $VERSION = '0.17';
+  $VERSION = '0.18';
 
   %PARAMS = (
     IGNORE_REGEX,   [], 
@@ -64,30 +64,28 @@ BEGIN {
 our @APACHE_MODULE_COMMANDS = (
   {
     name          => IGNORE_REGEX,
-    func          => sub { push @{$PARAMS{&IGNORE_REGEX}}, $_[2..$#_]},
+    func          => __PACKAGE__ . '::_ignore_regex',
     req_override  => Apache::OR_ALL,
     args_how      => Apache::ITERATE,
     errmsg        => IGNORE_REGEX . ' pattern [pattern ...]',
   },
   {
     name          => DEFAULT_LANG,
-    func          => sub { $PARAMS{&DEFAULT_LANG} = $_[2]},
+    func          => __PACKAGE__ . '::_default_lang',
     req_override  => Apache::OR_ALL,
     args_how      => Apache::TAKE1,
     errmsg        => DEFAULT_LANG . ' language',
   },
   {
     name          => FORCE_LANG,
-    func          => sub { $PARAMS{&FORCE_LANG} = 
-                           ($_[2] =~ /^(1|true|on|yes)$/) },
+    func          => __PACKAGE__ . '::_force_lang',
     req_override  => Apache::OR_ALL,
     args_how      => Apache::TAKE1,
     errmsg        => FORCE_LANG . ' yes|no',
   },
   {
     name          => REDIR_PERM,
-    func          => sub { $PARAMS{&FORCE_LANG} = 
-                           ($_[2] =~ /^(1|true|on|yes)$/) },
+    func          => __PACKAGE__ . '::_redir_perm',
     req_override  => Apache::OR_ALL,
     args_how      => Apache::TAKE1,
     errmsg        => REDIR_PERM . ' yes|no',
@@ -97,7 +95,10 @@ our @APACHE_MODULE_COMMANDS = (
 our $A2 = LOCALE_CODE_ALPHA_2;
 our $A3 = LOCALE_CODE_ALPHA_3;
 
-our $DEFAULT;
+sub _ignore_regex { $PARAMS{&IGNORE_REGEX} = $_[2]}
+sub _default_lang { $PARAMS{&DEFAULT_LANG} = $_[2]}
+sub _force_lang   { $PARAMS{&FORCE_LANG} = ($_[2] =~ /^(1|true|on|yes)$/) }
+sub _redir_perm   { $PARAMS{&REDIR_PERM} = ($_[2] =~ /^(1|true|on|yes)$/) }
 
 sub _handler {
 my $r = shift;
@@ -236,8 +237,6 @@ sub set_accept_language {
       map { "$_=$accept->{$k}{$_}" } grep { $_ ne 'q' } keys %{$accept->{$k}}));
     }
   }
-  #$hdr .= ", $DEFAULT;q=0.0001" 
-  #  if (@order and !grep { $_ eq $DEFAULT } @order);
 
   # modify inbound header for following handlers
   $r->headers_in->set('Accept-Language', $hdr);
@@ -259,7 +258,7 @@ sub perform_redirection {
     if ($subr->status == Apache::OK) {
       my $fn = $subr->filename;
       my $cl = lc($subr->headers_out->get('Content-Language'));
-      my $df = lc(substr($DEFAULT, 0, 2));
+      my $df = lc(substr($PARAMS{&DEFAULT_LANG}, 0, 2));
       my $uri_out;
       
       # if the selected language major can be found in the default language
