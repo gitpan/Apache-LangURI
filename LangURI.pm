@@ -17,7 +17,7 @@ BEGIN {
 
   require mod_perl;
 
-  $VERSION = '0.18';
+  $VERSION = '0.19';
 
   %PARAMS = (
     IGNORE_REGEX,   [], 
@@ -34,8 +34,8 @@ BEGIN {
     require APR::URI;
     # this whines unless you "use" it. figure that one out.
     require Apache::Const;
-    Apache::Const->import(-compile => qw(OK DECLINED HTTP_MOVED_PERMANENTLY
-      REDIRECT SERVER_ERROR OR_ALL ITERATE TAKE1));
+    Apache::Const->import(-compile => qw(OK HTTP_OK DECLINED 
+      HTTP_MOVED_PERMANENTLY REDIRECT SERVER_ERROR OR_ALL ITERATE TAKE1));
     @ISA = qw(Apache::RequestRec);
 
     *handler = \&_handler_2;
@@ -47,7 +47,7 @@ BEGIN {
     Apache::Constants->import(qw(OK DECLINED HTTP_MOVED_PERMANENTLY
       REDIRECT SERVER_ERROR));
     @ISA = qw(Apache);
-    *Apache::OK                     = \&Apache::Constants::OK;
+    *Apache::OK = *Apache::HTTP_OK  = \&Apache::Constants::OK;
     *Apache::DECLINED               = \&Apache::Constants::DECLINED;
     *Apache::REDIRECT               = \&Apache::Constants::REDIRECT;
     *Apache::SERVER_ERROR           = \&Apache::Constants::SERVER_ERROR;
@@ -95,16 +95,30 @@ our @APACHE_MODULE_COMMANDS = (
 our $A2 = LOCALE_CODE_ALPHA_2;
 our $A3 = LOCALE_CODE_ALPHA_3;
 
-sub _ignore_regex { $PARAMS{&IGNORE_REGEX} = $_[2]}
-sub _default_lang { $PARAMS{&DEFAULT_LANG} = $_[2]}
-sub _force_lang   { $PARAMS{&FORCE_LANG} = ($_[2] =~ /^(1|true|on|yes)$/) }
-sub _redir_perm   { $PARAMS{&REDIR_PERM} = ($_[2] =~ /^(1|true|on|yes)$/) }
+sub _ignore_regex { 
+  $PARAMS{&IGNORE_REGEX} ||= [];
+  my $neg = $_[2] !~ s/^!// || 0;
+  my $re = eval { qr{$_[2]} };
+  die "Invalid regular expression $_[2]" if ($@);
+  push @{$PARAMS{&IGNORE_REGEX}}, sub { $neg == scalar(shift =~ $re) };
+}
+
+sub _default_lang { $PARAMS{&DEFAULT_LANG}  =  $_[2]                         }
+sub _force_lang   { $PARAMS{&FORCE_LANG}    = ($_[2] =~ /^(1|true|on|yes)$/) }
+sub _redir_perm   { $PARAMS{&REDIR_PERM}    = ($_[2] =~ /^(1|true|on|yes)$/) }
 
 sub _handler {
 my $r = shift;
-if ($r->is_initial_req) {
-  $r->verify_config;
-  $r->set_accept_language;
+  if ($r->is_initial_req) {
+    $r->verify_config;
+    for my $ignore (@{$PARAMS{&IGNORE_REGEX}}) {
+      if ($ignore->($r->uri)) {
+        $r->log->debug
+          (sprintf("Ignoring %s that matches ignore regex.", $r->uri));
+        return Apache::DECLINED;
+      }
+    }
+    $r->set_accept_language;
     return $r->perform_redirection;
   }
   return Apache::DECLINED;
@@ -122,10 +136,13 @@ sub _handler_2 : method {
 
 sub verify_config {
   my $r = shift;
-  map { defined $PARAMS{$_} or $PARAMS{$_} = $r->dir_config->get($_) } 
-   (FORCE_LANG, REDIR_PERM, DEFAULT_LANG);
-  @{$PARAMS{&IGNORE_REGEX}} = $r->dir_config->get(IGNORE_REGEX)
-    unless (@{$PARAMS{&IGNORE_REGEX}});
+  $PARAMS{&DEFAULT_LANG} ||= $r->dir_config->get(DEFAULT_LANG);
+  for my $bit (FORCE_LANG, REDIR_PERM) {
+    my $cfg = $r->dir_config->get($bit) || '';
+    $PARAMS{$bit} ||= scalar($cfg =~ /^(1|true|on|yes)$/i);
+  }
+  map { _ignore_regex(undef,undef,$_) } $r->dir_config->get(IGNORE_REGEX)
+    unless @{$PARAMS{&IGNORE_REGEX}};
 }
 
 sub get_accept_language {
@@ -181,13 +198,13 @@ sub translate_uri_path {
   my @uri = split(/\/+/, $r->uri, -1);
   my ($major, $minor);
   my $i = 1; # segment 0 will be an empty string
-  (@{$r->{qw(cnt pos)}}) = (0, 1);
+  (@{$r}{qw(cnt pos)}) = (0, 1);
   while ($i < @uri) {
     if ($uri[$i] =~ /^([A-Za-z]{2})(?:[\-_]([A-Za-z]{2,3}))?$/
         and (code2language($1) and 
           (!$2 || code2country($2,  length($2) == 2 ? $A2 : $A3)))) {
       if (my $subr = $r->lookup_uri(join('/', @uri[0..$i]))) {
-        if ($subr->status == Apache::OK and -e $subr->filename) {
+        if ($subr->status == Apache::HTTP_OK and -e $subr->filename) {
           $r->log->debug(sprintf('Existing path %s', $subr->filename));
           $i++;
           next;
@@ -252,12 +269,16 @@ sub perform_redirection {
   # prepare a subrequest that will discover if we are actually pointing
   # to anything
   my $uri  = '/' . join('/', @uri[1..$#uri]);
-  $r->log->debug(sprintf("Original uri: Modified uri: '%s'", $r->uri, $uri));
+  $r->log->debug
+    (sprintf("Original uri: '%s' Modified uri: '%s'", $r->uri, $uri));
   if ($PARAMS{&FORCE_LANG}) {
+    $r->log->debug
+      ("Attempting to enforce language-code path segment for $r->{lang}.");
     my $subr = $r->lookup_uri($uri || '/');
-    if ($subr->status == Apache::OK) {
+    if ($subr->status == Apache::HTTP_OK) {
+
       my $fn = $subr->filename;
-      my $cl = lc($subr->headers_out->get('Content-Language'));
+      #my $cl = lc($subr->headers_out->get('Content-Language'));
       my $df = lc(substr($PARAMS{&DEFAULT_LANG}, 0, 2));
       my $uri_out;
       
@@ -266,6 +287,8 @@ sub perform_redirection {
       # otherwise leave alone.
       
       if ($df eq $r->{major}) {
+        $r->log->debug
+          ("Default language '$df' is the same as major '$r->{major}'.");
         return Apache::DECLINED if ($r->{cnt} == 0); 
         if ($r->{cnt} == 1) {
           $r->log->debug(sprintf("Skipping on default language URI %s", $uri));
@@ -274,7 +297,7 @@ sub perform_redirection {
         }
         push @uri, '' if (-d $fn and (@uri == 1 or $uri[-1] ne ''));
         $uri_out = '/' . join('/', @uri[1..$#uri]) . 
-          ($r->args ? '?' . $r->args : '');
+          (defined($r->args) ? '?' . $r->args : '');
         $r->headers_out->set(Location => $uri_out);
         return $PARAMS{&REDIR_PERM} ? 
           Apache::HTTP_MOVED_PERMANENTLY : Apache::REDIRECT;
@@ -283,12 +306,16 @@ sub perform_redirection {
         # if the subrequest's filename returns a directory on the filesystem,
         # append an empty space so that a trailing slash will be added when
         # the path is reassembled.
+        $r->log->debug
+          ("Default language '$df' is different from major '$r->{major}'.");
         
         if (-d $fn and (@uri == 1 or $uri[-1] ne '')) {
           push @uri, '';
           # even if we had a language segment, we have to redirect or else
           # mod_dir will eat us.
           $r->{cnt} = 0;
+          $r->log->debug
+            ("Modifying path to prevent counteraction with mod_dir");
         }
 
         # if the selected major cannot be found in the default language
@@ -297,12 +324,16 @@ sub perform_redirection {
         unless ($r->{cnt} == 1) {
           splice(@uri, ($r->{cnt} ? $r->{pos} : -1), 0, $r->{lang});
           $uri_out = join('/', @uri) . ($r->args ? '?' . $r->args : '');
+          $r->log->debug("Redirecting request to '$uri_out'.");
           $r->headers_out->set(Location => $uri_out);
           return $PARAMS{&REDIR_PERM} ? 
             Apache::HTTP_MOVED_PERMANENTLY : Apache::REDIRECT;
         }
       }
     }
+  }
+  else {
+    $r->log->debug(FORCE_LANG . " not set. not redirecting.");
   }
   $r->uri($uri);
   return Apache::DECLINED;
