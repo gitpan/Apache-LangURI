@@ -1,4 +1,4 @@
-Apache/LangURI version 0.01
+Apache/LangURI version 0.16
 ===========================
 
 The README is used to introduce the module and provide instructions on
@@ -25,13 +25,15 @@ DEPENDENCIES
 
 This module requires these other modules and libraries:
 
-  blah blah blah
+  mod_perl
+  Locale::Language
+  Locale::Country
 
 COPYRIGHT AND LICENCE
 
 Put the correct copyright and licence information here.
 
-Copyright (C) 2003 dorian
+Copyright (C) 2003 dorian taylor, iCrystal Software Inc.
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself. 

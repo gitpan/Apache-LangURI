@@ -1,189 +1,312 @@
 package Apache::LangURI;
 
 use strict;
-use Apache::Constants qw(OK DECLINED DOCUMENT_FOLLOWS 
-                         HTTP_MOVED_PERMANENTLY REDIRECT SERVER_ERROR);
-use Apache::URI ();
+use warnings;
 use Apache::Log ();
 use Locale::Language qw(code2language);
 use Locale::Country  qw(LOCALE_CODE_ALPHA_2 LOCALE_CODE_ALPHA_3 code2country);
 
-use constant DEFAULT_LANG => 'DefaultLanguage';
-use constant FORCE_LANG   => 'ForceLanguage';
-use constant IGNORE_REGEX => 'IgnorePathRegex';
-use constant REDIR_PERM   => 'RedirectPermanent';
+our (@ISA, $VERSION, %PARAMS);
 
-our $VERSION = '0.14';
+BEGIN {
+  # if by some fluke we wanted to change the config directives
+  use constant IGNORE_REGEX => 'IgnorePathRegex';
+  use constant DEFAULT_LANG => 'DefaultLanguage';
+  use constant FORCE_LANG   => 'ForceLanguage';
+  use constant REDIR_PERM   => 'RedirectPermanent';
+
+  require mod_perl;
+
+  $VERSION = '0.17';
+
+  %PARAMS = (
+    IGNORE_REGEX,   [], 
+    DEFAULT_LANG,   'en',
+    FORCE_LANG,     1, 
+    REDIR_PERM,     0,
+  );
+
+  if ($mod_perl::VERSION >= 1.99) {
+    require Apache::RequestRec;
+    require Apache::SubRequest;
+    require Apache::RequestUtil;
+    require APR::Table;
+    require APR::URI;
+    # this whines unless you "use" it. figure that one out.
+    require Apache::Const;
+    Apache::Const->import(-compile => qw(OK DECLINED HTTP_MOVED_PERMANENTLY
+      REDIRECT SERVER_ERROR OR_ALL ITERATE TAKE1));
+    @ISA = qw(Apache::RequestRec);
+
+    *handler = \&_handler_2;
+  }
+  else {
+    require Apache;
+    require Apache::URI;
+    require Apache::Constants;
+    Apache::Constants->import(qw(OK DECLINED HTTP_MOVED_PERMANENTLY
+      REDIRECT SERVER_ERROR));
+    @ISA = qw(Apache);
+    *Apache::OK                     = \&Apache::Constants::OK;
+    *Apache::DECLINED               = \&Apache::Constants::DECLINED;
+    *Apache::REDIRECT               = \&Apache::Constants::REDIRECT;
+    *Apache::SERVER_ERROR           = \&Apache::Constants::SERVER_ERROR;
+    *Apache::HTTP_MOVED_PERMANENTLY = 
+      \&Apache::Constants::HTTP_MOVED_PERMANENTLY;
+    
+    # blech
+    *Apache::OR_ALL = *Apache::TAKE1 = *Apache::ITERATE = sub { 1 };
+
+    *handler = \&_handler_1;
+  }
+}
+
+our @APACHE_MODULE_COMMANDS = (
+  {
+    name          => IGNORE_REGEX,
+    func          => sub { push @{$PARAMS{&IGNORE_REGEX}}, $_[2..$#_]},
+    req_override  => Apache::OR_ALL,
+    args_how      => Apache::ITERATE,
+    errmsg        => IGNORE_REGEX . ' pattern [pattern ...]',
+  },
+  {
+    name          => DEFAULT_LANG,
+    func          => sub { $PARAMS{&DEFAULT_LANG} = $_[2]},
+    req_override  => Apache::OR_ALL,
+    args_how      => Apache::TAKE1,
+    errmsg        => DEFAULT_LANG . ' language',
+  },
+  {
+    name          => FORCE_LANG,
+    func          => sub { $PARAMS{&FORCE_LANG} = 
+                           ($_[2] =~ /^(1|true|on|yes)$/) },
+    req_override  => Apache::OR_ALL,
+    args_how      => Apache::TAKE1,
+    errmsg        => FORCE_LANG . ' yes|no',
+  },
+  {
+    name          => REDIR_PERM,
+    func          => sub { $PARAMS{&FORCE_LANG} = 
+                           ($_[2] =~ /^(1|true|on|yes)$/) },
+    req_override  => Apache::OR_ALL,
+    args_how      => Apache::TAKE1,
+    errmsg        => REDIR_PERM . ' yes|no',
+  },
+);
 
 our $A2 = LOCALE_CODE_ALPHA_2;
 our $A3 = LOCALE_CODE_ALPHA_3;
 
 our $DEFAULT;
 
-sub handler {
+sub _handler {
+my $r = shift;
+if ($r->is_initial_req) {
+  $r->verify_config;
+  $r->set_accept_language;
+    return $r->perform_redirection;
+  }
+  return Apache::DECLINED;
+}
+
+sub _handler_1 ($$) {
+  my $r = bless { r => $_[1] }, $_[0];
+  return $r->_handler;
+}
+
+sub _handler_2 : method {
+  my $r = bless { r => $_[1] }, $_[0];
+  return $r->_handler;
+}
+
+sub verify_config {
+  my $r = shift;
+  map { defined $PARAMS{$_} or $PARAMS{$_} = $r->dir_config->get($_) } 
+   (FORCE_LANG, REDIR_PERM, DEFAULT_LANG);
+  @{$PARAMS{&IGNORE_REGEX}} = $r->dir_config->get(IGNORE_REGEX)
+    unless (@{$PARAMS{&IGNORE_REGEX}});
+}
+
+sub get_accept_language {
   my $r   = shift;
-  my $log = $r->log;
 
-  # maybe some day get this off $ENV{LANG} ?
-  $DEFAULT ||= $r->dir_config(DEFAULT_LANG) || 'en';
+  my $hdr = $r->headers_in->get('Accept-Language');
+  return Apache::DECLINED unless $hdr;
 
-  if ($r->is_initial_req) {
-    for my $ignore ($r->dir_config->get(IGNORE_REGEX)) {
-      my $neg = $ignore !~ s/^!// || 0;
-      my $rx = eval { qr{$ignore} };
-      if ($@) {
-        $log->crit("Ignore regex $ignore is invalid: $@");
-        return SERVER_ERROR;
-      }
-      if ($neg == scalar($r->uri =~ $rx)) {
-        $log->debug("Ignoring URI which matches regex $ignore");
-        return DECLINED;
-      }
+  # acquire hash of from the Accept-Language header
+  my %accept;
+  my $seen = 0;
+  for (split(/\s*,\s*/, $hdr)) {
+    my ($key, @vals) = split /\s*;\s*/;
+    $key =~ tr/A-Z_/a-z-/;
+    $accept{$key} ||= {};
+    unless (@vals) {
+      # decrement quality assessment just a bit to indicate order
+      $accept{$key}{q} = 1 - ++$seen / 10000;
+      #$r->log->debug("$key => '1.0'");
     }
-    # split uri and iterate over each portion
-
-    # acquire hash of from the Accept-Language header
-    my %accept;
-    if (my $hdr = $r->header_in('Accept-Language')) {
-      for (split(/\s*,\s*/, $hdr)) {
-        my ($key, @vals) = split /\s*;\s*/;
-        $key =~ tr/A-Z_/a-z-/;
-        $accept{$key} ||= {};
-        unless (@vals) {
-          $accept{$key}{q} = 1;
-          $log->debug("$key => '1.0'");
-        }
-        for (@vals) {
-          my ($k, $v) = split /\s*=\s*/;
-          if ($k =~ /^qs?$/) {
-            # some useragents use qs :P
-            $v = 1 if ($v eq '');
-            $v = 1 if ($v > 1);
-            $v = 0 if ($v < 0);
-            $accept{$key}{q}  = $v;
-            $log->debug("$key => '$v'");
-          }
-          else {
-            $accept{$key}{$k} = $v;
-            $log->debug("$key => '$v'");
-          }
-        }
-      }
-    }
-
-    # walk the url path looking for language tags.
-    # future note: check for actual on-disk entities corresponding to 
-    # language tags via subrequests
-    
-    my @uri = split(/\/+/, $r->uri, -1);
-    my ($major, $minor);
-    my $i = 1; # segment 0 will be an empty string
-    my ($cnt, $pos) = (0, 1);
-    while ($i < @uri) {
-      if ($uri[$i] =~ /^([A-Za-z]{2})(?:[\-_]([A-Za-z]{2,3}))?$/
-          and (code2language($1) and 
-            (!$2 || code2country($2,  length($2) == 2 ? $A2 : $A3)))) {
-        if (my $subr = $r->lookup_uri(join('/', @uri[0..$i]))) {
-          if ($subr->status == DOCUMENT_FOLLOWS and -e $subr->filename) {
-            $log->debug(sprintf('Existing path %s', $subr->filename));
-            $i++;
-            next;
-          }
-        }
-        ($major, $minor) = (lc($1), lc($2));
-        $pos = $i; # set the index of the farthest-right language tag
-        $cnt++;    # increment the count of discovered tags in the path
-        splice(@uri, $i, 1);
+    my $seenq = 0;
+    for (@vals) {
+      my ($k, $v) = split /\s*=\s*/;
+      # some user agents use qs :P
+      if ($k =~ /^qs?$/) {
+        # no mucking about if the client sent us more than one q parameter.
+        next if $seenq;
+        $v = 1 - ++$seen / 10000 if (!defined $v or $v eq '' or $v > 1);
+        $v = 0 if ($v < 0);
+        $accept{$key}{q}  = $v;
+        #$r->log->debug("$key => '$v'");
+        $seenq = 1;
       }
       else {
-        $i++;
+        $accept{$key}{$k} = $v;
+        #$r->log->debug("$key => '$v'");
       }
     }
+  }
+  $r->{accept_langs} = \%accept;
+  return Apache::OK;
+}
 
-    # adjust Accept-Language header with new data
-    my $lang;
-    my @order = sort { $accept{$b}{q} <=> $accept{$a}{q} } keys %accept;
-    if ($major) {
-      $lang = ($minor ? "$major-$minor" : $major);
+sub translate_uri_path {
+  my $r = shift;
+
+  $r->get_accept_language unless defined $r->{accept_langs};
+
+  # walk the url path looking for language tags.
+  # future note: check for actual on-disk entities corresponding to 
+  # language tags via subrequests
+  
+  my @uri = split(/\/+/, $r->uri, -1);
+  my ($major, $minor);
+  my $i = 1; # segment 0 will be an empty string
+  (@{$r->{qw(cnt pos)}}) = (0, 1);
+  while ($i < @uri) {
+    if ($uri[$i] =~ /^([A-Za-z]{2})(?:[\-_]([A-Za-z]{2,3}))?$/
+        and (code2language($1) and 
+          (!$2 || code2country($2,  length($2) == 2 ? $A2 : $A3)))) {
+      if (my $subr = $r->lookup_uri(join('/', @uri[0..$i]))) {
+        if ($subr->status == Apache::OK and -e $subr->filename) {
+          $r->log->debug(sprintf('Existing path %s', $subr->filename));
+          $i++;
+          next;
+        }
+      }
+      ($major, $minor) = (lc($1), lc($2));
+      $r->{pos} = $i; # set the index of the farthest-right language tag
+      $r->{cnt}++;    # increment the count of discovered tags in the path
+      splice(@uri, $i, 1);
     }
     else {
-      $lang = (@order ? $order[0] : $DEFAULT);
+      $i++;
     }
-    my $m = $major || substr($lang, 0, 2);
-    my $hdr = "$lang;q=1.0";
-    $hdr .= ", $m;q=0.8" if $minor;
-    for my $k (@order) {
-      if ($k =~ /^$m/i) {
-        delete $accept{$k};
+  }
+  @{$r}{qw(major minor)} = ($major, $minor);
+  $r->{uri_parts} = \@uri;
+  return Apache::OK;
+}
+
+sub set_accept_language {
+  my $r = shift;
+  $r->get_accept_language;
+  $r->translate_uri_path;
+
+  # adjust Accept-Language header with new data
+  my $lang;
+  my $accept = $r->{accept_langs};
+  $accept->{$PARAMS{&DEFAULT_LANG}} = { q => 0.0001 } 
+    unless defined($accept->{$PARAMS{&DEFAULT_LANG}});
+  my @order = sort { $accept->{$b}{q} <=> $accept->{$a}{q} } keys %$accept;
+  if ($r->{major}) {
+    $lang = ($r->{minor} ? "$r->{major}-$r->{minor}" : $r->{major});
+  }
+  else {
+    $lang = (@order ? $order[0] : $PARAMS{&DEFAULT_LANG});
+  }
+  my $m = $r->{major} ||= substr($lang, 0, 2);
+  my $hdr = "$lang;q=1.0";
+  $hdr .= ", $m;q=0.8" if (defined $r->{minor} and $r->{minor} ne '');
+  for my $k (@order) {
+    if ($k =~ /^$m/i) {
+      delete $accept->{$k};
+    }
+    else {
+      # fucking rad.
+      $hdr .= sprintf(', %s;q=%.4f%s', $k, $accept->{$k}{q} / 2 , join(';', '', 
+      map { "$_=$accept->{$k}{$_}" } grep { $_ ne 'q' } keys %{$accept->{$k}}));
+    }
+  }
+  #$hdr .= ", $DEFAULT;q=0.0001" 
+  #  if (@order and !grep { $_ eq $DEFAULT } @order);
+
+  # modify inbound header for following handlers
+  $r->headers_in->set('Accept-Language', $hdr);
+  $r->log->debug("Accept-Language: $hdr");
+  $r->{lang} = $lang;
+  return Apache::OK;
+}
+
+sub perform_redirection {
+  my $r = shift;
+  my @uri = @{$r->{uri_parts}};
+
+  # prepare a subrequest that will discover if we are actually pointing
+  # to anything
+  my $uri  = '/' . join('/', @uri[1..$#uri]);
+  $r->log->debug(sprintf("Original uri: Modified uri: '%s'", $r->uri, $uri));
+  if ($PARAMS{&FORCE_LANG}) {
+    my $subr = $r->lookup_uri($uri || '/');
+    if ($subr->status == Apache::OK) {
+      my $fn = $subr->filename;
+      my $cl = lc($subr->headers_out->get('Content-Language'));
+      my $df = lc(substr($DEFAULT, 0, 2));
+      my $uri_out;
+      
+      # if the selected language major can be found in the default language
+      # redirect to a path with no rfc3066 segment if the path contains one
+      # otherwise leave alone.
+      
+      if ($df eq $r->{major}) {
+        return Apache::DECLINED if ($r->{cnt} == 0); 
+        if ($r->{cnt} == 1) {
+          $r->log->debug(sprintf("Skipping on default language URI %s", $uri));
+          $r->uri($uri);
+          return Apache::DECLINED;
+        }
+        push @uri, '' if (-d $fn and (@uri == 1 or $uri[-1] ne ''));
+        $uri_out = '/' . join('/', @uri[1..$#uri]) . 
+          ($r->args ? '?' . $r->args : '');
+        $r->headers_out->set(Location => $uri_out);
+        return $PARAMS{&REDIR_PERM} ? 
+          Apache::HTTP_MOVED_PERMANENTLY : Apache::REDIRECT;
       }
       else {
-        # fucking rad.
-        $hdr .= sprintf(', %s;q=%.4f%s', $k, $accept{$k}{q} / 2 , join(';', '', 
-          map { "$_=$accept{$k}{$_}" } grep { $_ ne 'q' } keys %{$accept{$k}}));
-      }
-    }
-    $hdr .= ", $DEFAULT;q=0.0001" 
-      if (@order and !grep { $_ eq $DEFAULT } @order);
-
-    # modify inbound header for following handlers
-    $r->header_in('Accept-Language', $hdr);
-    $log->debug("Accept-Language: $hdr");
-
-    # prepare a subrequest that will discover if we are actually pointing
-    # to anything
-    my $uri  = join('/', @uri);
-    if ($r->dir_config(FORCE_LANG) =~ /^(1|true|on|yes)$/) {
-      my $subr = $r->lookup_uri($uri || '/');
-      if ($subr->status == DOCUMENT_FOLLOWS) {
-        my $fn = $subr->filename;
-        my $cl = lc($subr->header_out('Content-Language'));
-        my $df = lc(substr($DEFAULT, 0, 2));
-        my $uri_out;
+        # if the subrequest's filename returns a directory on the filesystem,
+        # append an empty space so that a trailing slash will be added when
+        # the path is reassembled.
         
-        # if the selected language major can be found in the default language
-        # redirect to a path with no rfc3066 segment if the path contains one
-        # otherwise leave alone.
-        
-        if ($df eq $m) {
-          return DECLINED if ($cnt == 0); 
-          if ($cnt == 1) {
-            $log->debug(sprintf("Skipping on default language URI %s", $uri));
-            $r->uri($uri);
-            return DECLINED;
-          }
-          push @uri, '' if (-d $fn and (@uri == 1 or $uri[-1] ne ''));
+        if (-d $fn and (@uri == 1 or $uri[-1] ne '')) {
+          push @uri, '';
+          # even if we had a language segment, we have to redirect or else
+          # mod_dir will eat us.
+          $r->{cnt} = 0;
+        }
+
+        # if the selected major cannot be found in the default language
+        # append the rfc3066 segment to the path if it does not contain one.
+      
+        unless ($r->{cnt} == 1) {
+          splice(@uri, ($r->{cnt} ? $r->{pos} : -1), 0, $r->{lang});
           $uri_out = join('/', @uri) . ($r->args ? '?' . $r->args : '');
-          $r->header_out(Location => $uri_out);
-          return REDIRECT;
-        }
-        else {
-          # if the subrequest's filename returns a directory on the filesystem,
-          # append an empty space so that a trailing slash will be added when
-          # the path is reassembled.
-          
-          if (-d $fn and (@uri == 1 or $uri[-1] ne '')) {
-            push @uri, '';
-            # even if we had a language segment, we have to redirect or else
-            # mod_dir will eat us.
-            $cnt = 0;
-          }
-
-          # if the selected major cannot be found in the default language
-          # append the rfc3066 segment to the path if it does not contain one.
-        
-          unless ($cnt == 1) {
-            splice(@uri, ($cnt ? $pos : -1), 0, $lang);
-            $uri_out = join('/', @uri) . ($r->args ? '?' . $r->args : '');
-            $r->header_out(Location => $uri_out);
-            return $r->dir_config(REDIR_PERM) =~ /^(1|true|on|yes)$/ ? 
-              HTTP_MOVED_PERMANENTLY : REDIRECT;
-          }
+          $r->headers_out->set(Location => $uri_out);
+          return $PARAMS{&REDIR_PERM} ? 
+            Apache::HTTP_MOVED_PERMANENTLY : Apache::REDIRECT;
         }
       }
     }
-    $r->uri($uri);
   }
-  return DECLINED;
+  $r->uri($uri);
+  return Apache::DECLINED;
 }
 
 1;
@@ -274,7 +397,7 @@ ISO 3166
 
 =head1 AUTHOR
 
-Dorian Taylor, E<lt>dorian@foobarsystems.comE<gt>
+Dorian Taylor, E<lt>dorian@cpan.orgE<gt>
 
 =head1 COPYRIGHT
 
